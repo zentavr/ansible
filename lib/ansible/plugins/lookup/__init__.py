@@ -19,22 +19,27 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-from abc import ABCMeta, abstractmethod
+from abc import abstractmethod
 
-from ansible.compat.six import with_metaclass
+from ansible.errors import AnsibleFileNotFound
+from ansible.plugins import AnsiblePlugin
+from ansible.utils.display import Display
 
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+display = Display()
 
 __all__ = ['LookupBase']
 
-class LookupBase(with_metaclass(ABCMeta, object)):
+
+class LookupBase(AnsiblePlugin):
+
     def __init__(self, loader=None, templar=None, **kwargs):
+
+        super(LookupBase, self).__init__()
+
         self._loader = loader
         self._templar = templar
+
+        # Backwards compat: self._display isn't really needed, just import the global display and use that.
         self._display = display
 
     def get_basedir(self, variables):
@@ -58,7 +63,7 @@ class LookupBase(with_metaclass(ABCMeta, object)):
         results = []
         for x in a:
             for y in b:
-                results.append(LookupBase._flatten([x,y]))
+                results.append(LookupBase._flatten([x, y]))
         return results
 
     @staticmethod
@@ -95,7 +100,26 @@ class LookupBase(with_metaclass(ABCMeta, object)):
         must be converted into python's unicode type as the strings will be run
         through jinja2 which has this requirement.  You can use::
 
-            from ansible.module_utils.unicode import to_unicode
-            result_string = to_unicode(result_string)
+            from ansible.module_utils._text import to_text
+            result_string = to_text(result_string)
         """
         pass
+
+    def find_file_in_search_path(self, myvars, subdir, needle, ignore_missing=False):
+        '''
+        Return a file (needle) in the task's expected search path.
+        '''
+
+        if 'ansible_search_path' in myvars:
+            paths = myvars['ansible_search_path']
+        else:
+            paths = [self.get_basedir(myvars)]
+
+        result = None
+        try:
+            result = self._loader.path_dwim_relative_stack(paths, subdir, needle)
+        except AnsibleFileNotFound:
+            if not ignore_missing:
+                self._display.warning("Unable to find '%s' in expected paths (use -vvvvv to see paths)" % needle)
+
+        return result

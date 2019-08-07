@@ -1,6 +1,7 @@
-# (c) 2013-2014, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2013-2016, Michael DeHaan <michael.dehaan@gmail.com>
 #           Stephen Fromm <sfromm@gmail.com>
 #           Brian Coca  <briancoca+dev@gmail.com>
+#           Toshio Kuratomi  <tkuratomi@ansible.com>
 #
 # This file is part of Ansible
 #
@@ -18,13 +19,17 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import codecs
 import os
 import os.path
-import tempfile
 import re
+import tempfile
 
+from ansible import constants as C
+from ansible.errors import AnsibleError, AnsibleAction, _AnsibleActionDone, AnsibleActionFail
+from ansible.module_utils._text import to_native, to_text
+from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.plugins.action import ActionBase
-from ansible.utils.boolean import boolean
 from ansible.utils.hashing import checksum_s
 
 
@@ -32,40 +37,42 @@ class ActionModule(ActionBase):
 
     TRANSFERS_FILES = True
 
-    def _assemble_from_fragments(self, src_path, delimiter=None, compiled_regexp=None, ignore_hidden=False):
+    def _assemble_from_fragments(self, src_path, delimiter=None, compiled_regexp=None, ignore_hidden=False, decrypt=True):
         ''' assemble a file from a directory of fragments '''
 
-        tmpfd, temp_path = tempfile.mkstemp()
-        tmp = os.fdopen(tmpfd,'w')
+        tmpfd, temp_path = tempfile.mkstemp(dir=C.DEFAULT_LOCAL_TMP)
+        tmp = os.fdopen(tmpfd, 'wb')
         delimit_me = False
         add_newline = False
 
-        for f in sorted(os.listdir(src_path)):
+        for f in (to_text(p, errors='surrogate_or_strict') for p in sorted(os.listdir(src_path))):
             if compiled_regexp and not compiled_regexp.search(f):
                 continue
-            fragment = "%s/%s" % (src_path, f)
+            fragment = u"%s/%s" % (src_path, f)
             if not os.path.isfile(fragment) or (ignore_hidden and os.path.basename(fragment).startswith('.')):
                 continue
-            fragment_content = file(fragment).read()
+
+            with open(self._loader.get_real_file(fragment, decrypt=decrypt), 'rb') as fragment_fh:
+                fragment_content = fragment_fh.read()
 
             # always put a newline between fragments if the previous fragment didn't end with a newline.
             if add_newline:
-                tmp.write('\n')
+                tmp.write(b'\n')
 
             # delimiters should only appear between fragments
             if delimit_me:
                 if delimiter:
                     # un-escape anything like newlines
-                    delimiter = delimiter.decode('unicode-escape')
+                    delimiter = codecs.escape_decode(delimiter)[0]
                     tmp.write(delimiter)
                     # always make sure there's a newline after the
                     # delimiter, so lines don't run together
-                    if delimiter[-1] != '\n':
-                        tmp.write('\n')
+                    if delimiter[-1] != b'\n':
+                        tmp.write(b'\n')
 
             tmp.write(fragment_content)
             delimit_me = True
-            if fragment_content.endswith('\n'):
+            if fragment_content.endswith(b'\n'):
                 add_newline = False
             else:
                 add_newline = True
@@ -74,86 +81,85 @@ class ActionModule(ActionBase):
         return temp_path
 
     def run(self, tmp=None, task_vars=None):
+
+        self._supports_check_mode = False
+
+        result = super(ActionModule, self).run(tmp, task_vars)
+        del tmp  # tmp no longer has any effect
+
         if task_vars is None:
             task_vars = dict()
 
-        result = super(ActionModule, self).run(tmp, task_vars)
-
-        if self._play_context.check_mode:
-            result['skipped'] = True
-            result['msg'] = "skipped, this module does not support check_mode."
-            return result
-
-        src        = self._task.args.get('src', None)
-        dest       = self._task.args.get('dest', None)
-        delimiter  = self._task.args.get('delimiter', None)
+        src = self._task.args.get('src', None)
+        dest = self._task.args.get('dest', None)
+        delimiter = self._task.args.get('delimiter', None)
         remote_src = self._task.args.get('remote_src', 'yes')
-        regexp     = self._task.args.get('regexp', None)
+        regexp = self._task.args.get('regexp', None)
+        follow = self._task.args.get('follow', False)
         ignore_hidden = self._task.args.get('ignore_hidden', False)
+        decrypt = self._task.args.get('decrypt', True)
 
-        if src is None or dest is None:
-            result['failed'] = True
-            result['msg'] = "src and dest are required"
-            return result
+        try:
+            if src is None or dest is None:
+                raise AnsibleActionFail("src and dest are required")
 
-        if boolean(remote_src):
-            result.update(self._execute_module(tmp=tmp, task_vars=task_vars))
-            return result
+            if boolean(remote_src, strict=False):
+                result.update(self._execute_module(module_name='assemble', task_vars=task_vars))
+                raise _AnsibleActionDone()
+            else:
+                try:
+                    src = self._find_needle('files', src)
+                except AnsibleError as e:
+                    raise AnsibleActionFail(to_native(e))
 
-        elif self._task._role is not None:
-            src = self._loader.path_dwim_relative(self._task._role._role_path, 'files', src)
-        else:
-            src = self._loader.path_dwim_relative(self._loader.get_basedir(), 'files', src)
+            if not os.path.isdir(src):
+                raise AnsibleActionFail(u"Source (%s) is not a directory" % src)
 
-        _re = None
-        if regexp is not None:
-            _re = re.compile(regexp)
+            _re = None
+            if regexp is not None:
+                _re = re.compile(regexp)
 
-        # Does all work assembling the file
-        path = self._assemble_from_fragments(src, delimiter, _re, ignore_hidden)
+            # Does all work assembling the file
+            path = self._assemble_from_fragments(src, delimiter, _re, ignore_hidden, decrypt)
 
-        path_checksum = checksum_s(path)
-        dest = self._remote_expand_user(dest)
-        remote_checksum = self._remote_checksum(dest, all_vars=task_vars)
+            path_checksum = checksum_s(path)
+            dest = self._remote_expand_user(dest)
+            dest_stat = self._execute_remote_stat(dest, all_vars=task_vars, follow=follow)
 
-        diff = {}
-        if path_checksum != remote_checksum:
-            resultant = file(path).read()
+            diff = {}
 
-            if self._play_context.diff:
-                diff = self._get_diff_data(dest, path, task_vars)
-
-            xfered = self._transfer_data('src', resultant)
-
-            # fix file permissions when the copy is done as a different user
-            if self._play_context.become and self._play_context.become_user != 'root':
-                self._remote_chmod('a+r', xfered)
-
-            # run the copy module
-
+            # setup args for running modules
             new_module_args = self._task.args.copy()
-            new_module_args.update(
-                dict(
-                    src=xfered,
-                    dest=dest,
-                    original_basename=os.path.basename(src),
-                )
-            )
 
-            res = self._execute_module(module_name='copy', module_args=new_module_args, task_vars=task_vars, tmp=tmp)
-            if diff:
-                res['diff'] = diff
-            result.update(res)
-            return result
-        else:
-            new_module_args = self._task.args.copy()
-            new_module_args.update(
-                dict(
-                    src=xfered,
-                    dest=dest,
-                    original_basename=os.path.basename(src),
-                )
-            )
+            # clean assemble specific options
+            for opt in ['remote_src', 'regexp', 'delimiter', 'ignore_hidden', 'decrypt']:
+                if opt in new_module_args:
+                    del new_module_args[opt]
+            new_module_args['dest'] = dest
 
-            result.update(self._execute_module(module_name='file', module_args=new_module_args, task_vars=task_vars, tmp=tmp))
-            return result
+            if path_checksum != dest_stat['checksum']:
+
+                if self._play_context.diff:
+                    diff = self._get_diff_data(dest, path, task_vars)
+
+                remote_path = self._connection._shell.join_path(self._connection._shell.tmpdir, 'src')
+                xfered = self._transfer_file(path, remote_path)
+
+                # fix file permissions when the copy is done as a different user
+                self._fixup_perms2((self._connection._shell.tmpdir, remote_path))
+
+                new_module_args.update(dict(src=xfered,))
+
+                res = self._execute_module(module_name='copy', module_args=new_module_args, task_vars=task_vars)
+                if diff:
+                    res['diff'] = diff
+                result.update(res)
+            else:
+                result.update(self._execute_module(module_name='file', module_args=new_module_args, task_vars=task_vars))
+
+        except AnsibleAction as e:
+            result.update(e.result)
+        finally:
+            self._remove_tmp_path(self._connection._shell.tmpdir)
+
+        return result

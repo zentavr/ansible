@@ -19,25 +19,22 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-from collections import Iterable
-
-from ansible.compat.six import string_types
-
-from ansible.template import Templar
+from ansible.module_utils.six import string_types
+from ansible.module_utils.common._collections_compat import Iterable
 from ansible.template.safe_eval import safe_eval
+
 
 __all__ = ['listify_lookup_plugin_terms']
 
-def listify_lookup_plugin_terms(terms, templar, loader, fail_on_undefined=False, convert_bare=True):
+
+def listify_lookup_plugin_terms(terms, templar, loader, fail_on_undefined=True, convert_bare=False):
 
     if isinstance(terms, string_types):
-        stripped = terms.strip()
-        # TODO: warn/deprecation on bare vars in with_ so we can eventually remove fail on undefined override
-        terms = templar.template(terms, convert_bare=convert_bare, fail_on_undefined=fail_on_undefined)
+        terms = templar.template(terms.strip(), convert_bare=convert_bare, fail_on_undefined=fail_on_undefined)
     else:
         terms = templar.template(terms, fail_on_undefined=fail_on_undefined)
 
     if isinstance(terms, string_types) or not isinstance(terms, Iterable):
-        terms = [ terms ]
+        terms = [terms]
 
     return terms

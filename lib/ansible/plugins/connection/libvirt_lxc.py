@@ -2,37 +2,43 @@
 # Based on chroot.py (c) 2013, Maykel Moya <mmoya@speedyrails.com>
 # (c) 2013, Michael Scherer <misc@zarb.org>
 # (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# (c) 2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
+
+DOCUMENTATION = """
+    author: Michael Scherer <misc@zarb.org>
+    connection: libvirt_lxc
+    short_description: Run tasks in lxc containers via libvirt
+    description:
+        - Run commands or put/fetch files to an existing lxc container using libvirt
+    version_added: "2.0"
+    options:
+      remote_addr:
+        description:
+            - Container identifier
+        default: The set user as per docker's configuration
+        vars:
+            - name: ansible_host
+            - name: ansible_libvirt_lxc_host
+"""
 
 import distutils.spawn
 import os
 import os.path
-import pipes
 import subprocess
 import traceback
 
 from ansible import constants as C
 from ansible.errors import AnsibleError
-from ansible.plugins.connection import ConnectionBase
+from ansible.module_utils.six.moves import shlex_quote
+from ansible.module_utils._text import to_bytes
+from ansible.plugins.connection import ConnectionBase, BUFSIZE
+from ansible.utils.display import Display
 
-
-BUFSIZE = 65536
+display = Display()
 
 
 class Connection(ConnectionBase):
@@ -43,7 +49,8 @@ class Connection(ConnectionBase):
     # su currently has an undiagnosed issue with calculating the file
     # checksums (so copy, for instance, doesn't work right)
     # Have to look into that before re-enabling this
-    become_methods = frozenset(C.BECOME_METHODS).difference(('su',))
+    default_user = 'root'
+    has_tty = False
 
     def __init__(self, play_context, new_stdin, *args, **kwargs):
         super(Connection, self).__init__(play_context, new_stdin, *args, **kwargs)
@@ -60,7 +67,7 @@ class Connection(ConnectionBase):
         return cmd
 
     def _check_domain(self, domain):
-        p = subprocess.Popen([self.virsh, '-q', '-c', 'lxc:///', 'dominfo', domain],
+        p = subprocess.Popen([self.virsh, '-q', '-c', 'lxc:///', 'dominfo', to_bytes(domain)],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p.communicate()
         if p.returncode:
@@ -70,7 +77,7 @@ class Connection(ConnectionBase):
         ''' connect to the lxc; nothing to do here '''
         super(Connection, self)._connect()
         if not self._connected:
-            self._display.vvv("THIS IS A LOCAL LXC DIR", host=self.lxc)
+            display.vvv("THIS IS A LOCAL LXC DIR", host=self.lxc)
             self._connected = True
 
     def _buffered_exec_command(self, cmd, stdin=subprocess.PIPE):
@@ -82,11 +89,17 @@ class Connection(ConnectionBase):
         return the process's exit code immediately.
         '''
         executable = C.DEFAULT_EXECUTABLE.split()[0] if C.DEFAULT_EXECUTABLE else '/bin/sh'
-        local_cmd = [self.virsh, '-q', '-c', 'lxc:///', 'lxc-enter-namespace', self.lxc, '--', executable , '-c', cmd]
+        local_cmd = [self.virsh, '-q', '-c', 'lxc:///', 'lxc-enter-namespace']
 
-        self._display.vvv("EXEC %s" % (local_cmd), host=self.lxc)
+        if C.DEFAULT_LIBVIRT_LXC_NOSECLABEL:
+            local_cmd += ['--noseclabel']
+
+        local_cmd += [self.lxc, '--', executable, '-c', cmd]
+
+        display.vvv("EXEC %s" % (local_cmd,), host=self.lxc)
+        local_cmd = [to_bytes(i, errors='surrogate_or_strict') for i in local_cmd]
         p = subprocess.Popen(local_cmd, shell=False, stdin=stdin,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         return p
 
@@ -116,18 +129,22 @@ class Connection(ConnectionBase):
     def put_file(self, in_path, out_path):
         ''' transfer a file from local to lxc '''
         super(Connection, self).put_file(in_path, out_path)
-        self._display.vvv("PUT %s TO %s" % (in_path, out_path), host=self.lxc)
+        display.vvv("PUT %s TO %s" % (in_path, out_path), host=self.lxc)
 
-        out_path = pipes.quote(self._prefix_login_path(out_path))
+        out_path = shlex_quote(self._prefix_login_path(out_path))
         try:
-            with open(in_path, 'rb') as in_file:
+            with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
+                if not os.fstat(in_file.fileno()).st_size:
+                    count = ' count=0'
+                else:
+                    count = ''
                 try:
-                    p = self._buffered_exec_command('dd of=%s bs=%s' % (out_path, BUFSIZE), stdin=in_file)
+                    p = self._buffered_exec_command('dd of=%s bs=%s%s' % (out_path, BUFSIZE, count), stdin=in_file)
                 except OSError:
                     raise AnsibleError("chroot connection requires dd command in the chroot")
                 try:
                     stdout, stderr = p.communicate()
-                except:
+                except Exception:
                     traceback.print_exc()
                     raise AnsibleError("failed to transfer file %s to %s" % (in_path, out_path))
                 if p.returncode != 0:
@@ -138,21 +155,21 @@ class Connection(ConnectionBase):
     def fetch_file(self, in_path, out_path):
         ''' fetch a file from lxc to local '''
         super(Connection, self).fetch_file(in_path, out_path)
-        self._display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.lxc)
+        display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.lxc)
 
-        in_path = pipes.quote(self._prefix_login_path(in_path))
+        in_path = shlex_quote(self._prefix_login_path(in_path))
         try:
             p = self._buffered_exec_command('dd if=%s bs=%s' % (in_path, BUFSIZE))
         except OSError:
             raise AnsibleError("chroot connection requires dd command in the chroot")
 
-        with open(out_path, 'wb+') as out_file:
+        with open(to_bytes(out_path, errors='surrogate_or_strict'), 'wb+') as out_file:
             try:
                 chunk = p.stdout.read(BUFSIZE)
                 while chunk:
                     out_file.write(chunk)
                     chunk = p.stdout.read(BUFSIZE)
-            except:
+            except Exception:
                 traceback.print_exc()
                 raise AnsibleError("failed to transfer file %s to %s" % (in_path, out_path))
             stdout, stderr = p.communicate()

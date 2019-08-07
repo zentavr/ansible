@@ -24,52 +24,47 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 import os
+import yaml
 
-from ansible.compat.six import string_types
-
-from ansible.errors import AnsibleError
-from ansible.utils.display import Display
+from ansible import context
+from ansible.module_utils._text import to_bytes
 
 #      default_readme_template
 #      default_meta_template
 
 
+def get_collections_galaxy_meta_info():
+    meta_path = os.path.join(os.path.dirname(__file__), 'data', 'collections_galaxy_meta.yml')
+    with open(to_bytes(meta_path, errors='surrogate_or_strict'), 'rb') as galaxy_obj:
+        return yaml.safe_load(galaxy_obj)
+
+
 class Galaxy(object):
     ''' Keeps global galaxy info '''
 
-    def __init__(self, options, display=None):
+    def __init__(self):
 
-        if display is None:
-            self.display = Display()
-        else:
-            self.display = display
+        # roles_path needs to be a list and will be by default
+        roles_path = context.CLIARGS.get('roles_path', tuple())
+        # cli option handling is responsible for splitting roles_path
+        self.roles_paths = roles_path
 
-        self.options = options
-        roles_paths = getattr(self.options, 'roles_path', [])
-        if isinstance(roles_paths, string_types):
-            self.roles_paths = [os.path.expanduser(roles_path) for roles_path in roles_paths.split(os.pathsep)]
-
-        self.roles =  {}
+        self.roles = {}
 
         # load data path for resource usage
         this_dir, this_filename = os.path.split(__file__)
-        self.DATA_PATH = os.path.join(this_dir, "data")
+        type_path = context.CLIARGS.get('role_type', 'default')
+        if type_path == 'default':
+            type_path = os.path.join(type_path, context.CLIARGS.get('type'))
 
-        #TODO: move to getter for lazy loading
-        self.default_readme = self._str_from_data_file('readme')
-        self.default_meta = self._str_from_data_file('metadata_template.j2')
+        self.DATA_PATH = os.path.join(this_dir, 'data', type_path)
+
+    @property
+    def default_role_skeleton_path(self):
+        return self.DATA_PATH
 
     def add_role(self, role):
         self.roles[role.name] = role
 
     def remove_role(self, role_name):
         del self.roles[role_name]
-
-
-    def _str_from_data_file(self, filename):
-        myfile = os.path.join(self.DATA_PATH, filename)
-        try:
-            return open(myfile).read()
-        except Exception as e:
-            raise AnsibleError("Could not open %s: %s" % (filename, str(e)))
-

@@ -28,17 +28,14 @@ version_added: None
 author: Michael Scherer
 '''
 
-try:
-    import json
-except ImportError:
-    import simplejson as json
+import json
 import os
 import os.path
 import sys
-import ConfigParser
 import StringIO
 
 from ansible.module_utils.urls import open_url
+from ansible.module_utils.six.moves import configparser as ConfigParser
 
 configparser = None
 
@@ -62,8 +59,7 @@ def get_config(env_var, config_var):
     if not result:
         result = get_from_rhc_config(config_var)
     if not result:
-        print("failed=True msg='missing %s'" % env_var)
-        sys.exit(1)
+        sys.exit("failed=True msg='missing %s'" % env_var)
     return result
 
 

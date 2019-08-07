@@ -20,10 +20,12 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 import yaml
-from ansible.compat.six import PY3
 
-from ansible.parsing.yaml.objects import AnsibleUnicode
-from ansible.vars.hostvars import HostVars
+from ansible.module_utils.six import PY3
+from ansible.parsing.yaml.objects import AnsibleUnicode, AnsibleSequence, AnsibleMapping, AnsibleVaultEncryptedUnicode
+from ansible.utils.unsafe_proxy import AnsibleUnsafeText
+from ansible.vars.hostvars import HostVars, HostVarsVars
+
 
 class AnsibleDumper(yaml.SafeDumper):
     '''
@@ -32,8 +34,15 @@ class AnsibleDumper(yaml.SafeDumper):
     '''
     pass
 
+
 def represent_hostvars(self, data):
     return self.represent_dict(dict(data))
+
+
+# Note: only want to represent the encrypted data
+def represent_vault_encrypted_unicode(self, data):
+    return self.represent_scalar(u'!vault', data._ciphertext.decode(), style='|')
+
 
 if PY3:
     represent_unicode = yaml.representer.SafeRepresenter.represent_str
@@ -46,7 +55,31 @@ AnsibleDumper.add_representer(
 )
 
 AnsibleDumper.add_representer(
+    AnsibleUnsafeText,
+    represent_unicode,
+)
+
+AnsibleDumper.add_representer(
     HostVars,
     represent_hostvars,
 )
 
+AnsibleDumper.add_representer(
+    HostVarsVars,
+    represent_hostvars,
+)
+
+AnsibleDumper.add_representer(
+    AnsibleSequence,
+    yaml.representer.SafeRepresenter.represent_list,
+)
+
+AnsibleDumper.add_representer(
+    AnsibleMapping,
+    yaml.representer.SafeRepresenter.represent_dict,
+)
+
+AnsibleDumper.add_representer(
+    AnsibleVaultEncryptedUnicode,
+    represent_vault_encrypted_unicode,
+)

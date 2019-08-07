@@ -30,42 +30,45 @@ required if these options are specified using environment variables.
 
 from __future__ import print_function
 
-import collections
 import json
 import logging
 import optparse
 import os
+import ssl
 import sys
 import time
-import ConfigParser
 
-from six import text_type
+from ansible.module_utils.common._collections_compat import MutableMapping
+from ansible.module_utils.six import integer_types, text_type, string_types
+from ansible.module_utils.six.moves import configparser
 
 # Disable logging message trigged by pSphere/suds.
 try:
     from logging import NullHandler
 except ImportError:
     from logging import Handler
+
     class NullHandler(Handler):
         def emit(self, record):
             pass
+
 logging.getLogger('psphere').addHandler(NullHandler())
 logging.getLogger('suds').addHandler(NullHandler())
 
 from psphere.client import Client
 from psphere.errors import ObjectNotFoundError
-from psphere.managedobjects import HostSystem, VirtualMachine, ManagedObject, Network
+from psphere.managedobjects import HostSystem, VirtualMachine, ManagedObject, Network, ClusterComputeResource
 from suds.sudsobject import Object as SudsObject
 
 
 class VMwareInventory(object):
 
     def __init__(self, guests_only=None):
-        self.config = ConfigParser.SafeConfigParser()
+        self.config = configparser.SafeConfigParser()
         if os.environ.get('VMWARE_INI', ''):
             config_files = [os.environ['VMWARE_INI']]
         else:
-            config_files =  [os.path.abspath(sys.argv[0]).rstrip('.py') + '.ini', 'vmware.ini']
+            config_files = [os.path.abspath(sys.argv[0]).rstrip('.py') + '.ini', 'vmware.ini']
         for config_file in config_files:
             if os.path.exists(config_file):
                 self.config.read(config_file)
@@ -90,6 +93,28 @@ class VMwareInventory(object):
         auth_password = os.environ.get('VMWARE_PASSWORD')
         if not auth_password and self.config.has_option('auth', 'password'):
             auth_password = self.config.get('auth', 'password')
+        sslcheck = os.environ.get('VMWARE_SSLCHECK')
+        if not sslcheck and self.config.has_option('auth', 'sslcheck'):
+            sslcheck = self.config.get('auth', 'sslcheck')
+        if not sslcheck:
+            sslcheck = True
+        else:
+            if sslcheck.lower() in ['no', 'false']:
+                sslcheck = False
+            else:
+                sslcheck = True
+
+        # Limit the clusters being scanned
+        self.filter_clusters = os.environ.get('VMWARE_CLUSTERS')
+        if not self.filter_clusters and self.config.has_option('defaults', 'clusters'):
+            self.filter_clusters = self.config.get('defaults', 'clusters')
+        if self.filter_clusters:
+            self.filter_clusters = [x.strip() for x in self.filter_clusters.split(',') if x.strip()]
+
+        # Override certificate checks
+        if not sslcheck:
+            if hasattr(ssl, '_create_unverified_context'):
+                ssl._create_default_https_context = ssl._create_unverified_context
 
         # Create the VMware client connection.
         self.client = Client(auth_host, auth_user, auth_password)
@@ -134,10 +159,10 @@ class VMwareInventory(object):
             if k.startswith('_'):
                 continue
             new_key = parent_key + sep + k if parent_key else k
-            if isinstance(v, collections.MutableMapping):
+            if isinstance(v, MutableMapping):
                 items.extend(self._flatten_dict(v, new_key, sep).items())
             elif isinstance(v, (list, tuple)):
-                if all([isinstance(x, basestring) for x in v]):
+                if all([isinstance(x, string_types) for x in v]):
                     items.append((new_key, v))
             else:
                 items.append((new_key, v))
@@ -185,7 +210,7 @@ class VMwareInventory(object):
                 if obj_info != ():
                     l.append(obj_info)
             return l
-        elif isinstance(obj, (type(None), bool, int, long, float, basestring)):
+        elif isinstance(obj, (type(None), bool, float) + string_types + integer_types):
             return obj
         else:
             return ()
@@ -204,7 +229,7 @@ class VMwareInventory(object):
             except AttributeError:
                 host_info['%ss' % attr] = []
         for k, v in self._get_obj_info(host.summary, depth=0).items():
-            if isinstance(v, collections.MutableMapping):
+            if isinstance(v, MutableMapping):
                 for k2, v2 in v.items():
                     host_info[k2] = v2
             elif k != 'host':
@@ -240,7 +265,7 @@ class VMwareInventory(object):
         except AttributeError:
             vm_info['guestState'] = ''
         for k, v in self._get_obj_info(vm.summary, depth=0).items():
-            if isinstance(v, collections.MutableMapping):
+            if isinstance(v, MutableMapping):
                 for k2, v2 in v.items():
                     if k2 == 'host':
                         k2 = 'hostSystem'
@@ -314,8 +339,19 @@ class VMwareInventory(object):
         else:
             prefix_filter = None
 
+        if self.filter_clusters:
+            # Loop through clusters and find hosts:
+            hosts = []
+            for cluster in ClusterComputeResource.all(self.client):
+                if cluster.name in self.filter_clusters:
+                    for host in cluster.host:
+                        hosts.append(host)
+        else:
+            # Get list of all physical hosts
+            hosts = HostSystem.all(self.client)
+
         # Loop through physical hosts:
-        for host in HostSystem.all(self.client):
+        for host in hosts:
 
             if not self.guests_only:
                 self._add_host(inv, 'all', host.name)
@@ -328,7 +364,7 @@ class VMwareInventory(object):
             # Loop through all VMs on physical host.
             for vm in host.vm:
                 if prefix_filter:
-                    if vm.name.startswith( prefix_filter ):
+                    if vm.name.startswith(prefix_filter):
                         continue
                 self._add_host(inv, 'all', vm.name)
                 self._add_host(inv, vm_group, vm.name)
